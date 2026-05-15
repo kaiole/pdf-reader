@@ -15,6 +15,14 @@ Pi extension for reading technical PDFs with Poppler/qpdf/Tesseract tools.
 - `pdf_ocr` — OCR selected pages with Tesseract; cached per page/dpi/language.
 - `pdf_extract_images` — extract embedded PDF images/figures.
 
+## Structure
+
+- `index.ts` — Pi extension entry point.
+- `src/tools.ts` — `pi.registerTool(...)` definitions and tool orchestration.
+- `src/core.ts` — PDF/cache/search/render/OCR backend helpers.
+- `src/constants.ts` — defaults and limits.
+- `src/types.ts` — shared TypeScript types.
+
 ## Requirements
 
 The extension uses existing system tools:

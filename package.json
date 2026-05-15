@@ -14,8 +14,8 @@
   ],
   "files": [
     "index.ts",
-    "README.md",
-    "plan.md"
+    "src",
+    "README.md"
   ],
   "pi": {
     "extensions": [
