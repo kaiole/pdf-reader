@@ -1,0 +1,30 @@
+{
+  "name": "pi-pdf-reader",
+  "version": "0.1.0",
+  "description": "Pi extension for reading, searching, rendering, and OCRing technical PDFs.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pdf",
+    "ocr",
+    "research",
+    "books"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "plan.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
