@@ -21,6 +21,7 @@ const HARD_EXTRACT_MAX_CHARS = 120_000;
 const LARGE_DOCUMENT_PAGE_THRESHOLD = 25;
 const DEFAULT_SEARCH_MAX_RESULTS = 20;
 const SEARCH_PAGE_MATCH_LIMIT = 3;
+const PDF_TEXT_CHUNK_SIZE = 50;
 
 type TextQuality = "good" | "poor" | "none" | "unknown";
 
@@ -73,6 +74,19 @@ type Catalog = {
 	root: string;
 	generatedAt: string;
 	documents: CatalogDocument[];
+	partial?: boolean;
+	notes?: string;
+};
+
+// Sidecar metadata lets us verify page-cache freshness even when catalog.json is
+// missing, stale, or intentionally not persisted for a maxDocuments test run.
+type PageCacheMetadata = {
+	version: number;
+	path: string;
+	pages: number;
+	sizeBytes: number;
+	mtimeMs: number;
+	indexedAt: string;
 };
 
 type CachedPage = {
@@ -132,6 +146,10 @@ function catalogPath(root = cacheRoot()): string {
 
 function pageCachePath(docId: string, root = cacheRoot()): string {
 	return join(root, "pages", `${docId}.jsonl`);
+}
+
+function pageCacheMetaPath(docId: string, root = cacheRoot()): string {
+	return join(root, "pages", `${docId}.meta.json`);
 }
 
 function outlineCachePath(docId: string, root = cacheRoot()): string {
@@ -396,6 +414,7 @@ function parsePageSpec(spec: string, pageCount?: number): number[] {
 			for (let page = start; page <= end; page++) pages.add(page);
 			continue;
 		}
+		if (!/^\d+$/.test(part)) throw new Error(`Invalid page spec segment: ${rawPart}`);
 		const single = Number.parseInt(part, 10);
 		if (!Number.isFinite(single) || single <= 0) throw new Error(`Invalid page spec segment: ${rawPart}`);
 		pages.add(single);
@@ -519,6 +538,27 @@ async function extractPages(
 	return result;
 }
 
+async function* extractPageChunks(
+	pi: ExtensionAPI,
+	path: string,
+	pageCount: number,
+	mode: "plain" | "layout",
+	chunkSize = PDF_TEXT_CHUNK_SIZE,
+	signal?: AbortSignal,
+): AsyncGenerator<CachedPage[]> {
+	const total = Math.max(1, pageCount);
+	for (let first = 1; first <= total; first += Math.max(1, chunkSize)) {
+		const last = Math.min(total, first + Math.max(1, chunkSize) - 1);
+		const raw = await extractTextRange(pi, path, first, last, mode, signal);
+		const split = splitPopplerPages(raw);
+		yield Array.from({ length: last - first + 1 }, (_, index) => {
+			const page = first + index;
+			const text = split[index] ?? "";
+			return { page, text, layoutText: mode === "layout" ? text : undefined, quality: estimateTextQuality(text) };
+		});
+	}
+}
+
 function layoutToMarkdown(text: string): string {
 	const lines = text.replace(/[ \t]+$/gm, "").split(/\r?\n/);
 	return lines
@@ -599,6 +639,35 @@ async function writeCatalog(catalog: Catalog, root = cacheRoot()): Promise<void>
 	});
 }
 
+async function readPageCacheMetadata(docId: string, root = cacheRoot()): Promise<PageCacheMetadata | undefined> {
+	try {
+		const metadata = JSON.parse(await readFile(pageCacheMetaPath(docId, root), "utf8")) as PageCacheMetadata;
+		return metadata.version === CACHE_VERSION ? metadata : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function writePageCacheMetadata(
+	docId: string,
+	source: Pick<PdfInfo, "path" | "pages" | "sizeBytes" | "mtimeMs">,
+	root = cacheRoot(),
+): Promise<void> {
+	await ensureCacheDirs(root);
+	const path = pageCacheMetaPath(docId, root);
+	const metadata: PageCacheMetadata = {
+		version: CACHE_VERSION,
+		path: source.path,
+		pages: source.pages,
+		sizeBytes: source.sizeBytes,
+		mtimeMs: source.mtimeMs,
+		indexedAt: nowIso(),
+	};
+	await withFileMutationQueue(path, async () => {
+		await writeFile(path, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+	});
+}
+
 async function readCachedPages(docId: string, root = cacheRoot()): Promise<CachedPage[] | undefined> {
 	const path = pageCachePath(docId, root);
 	try {
@@ -610,15 +679,6 @@ async function readCachedPages(docId: string, root = cacheRoot()): Promise<Cache
 	} catch {
 		return undefined;
 	}
-}
-
-async function writeCachedPages(docId: string, pages: CachedPage[], root = cacheRoot()): Promise<void> {
-	await ensureCacheDirs(root);
-	const path = pageCachePath(docId, root);
-	const content = pages.map((page) => JSON.stringify(page)).join("\n") + "\n";
-	await withFileMutationQueue(path, async () => {
-		await writeFile(path, content, "utf8");
-	});
 }
 
 async function cacheOutline(docId: string, outline: OutlineEntry[], root = cacheRoot()): Promise<void> {
@@ -645,10 +705,52 @@ function isIndexedFresh(doc: CatalogDocument | undefined, fileStat: { size: numb
 	return true;
 }
 
+async function hasFreshPageCache(
+	docId: string,
+	fileStat: { size: number; mtimeMs: number },
+	doc?: CatalogDocument,
+	root = cacheRoot(),
+): Promise<boolean> {
+	if (!(await exists(pageCachePath(docId, root)))) return false;
+	const metadataPath = pageCacheMetaPath(docId, root);
+	const metadataFileExists = await exists(metadataPath);
+	const metadata = metadataFileExists ? await readPageCacheMetadata(docId, root) : undefined;
+	if (metadataFileExists) {
+		if (!metadata) return false;
+		if (metadata.sizeBytes !== fileStat.size) return false;
+		if (Math.abs(metadata.mtimeMs - fileStat.mtimeMs) > 2_000) return false;
+		return true;
+	}
+	return isIndexedFresh(doc, fileStat);
+}
+
+function mergeCatalogDocuments(base: CatalogDocument[], updates: CatalogDocument[]): CatalogDocument[] {
+	const byPath = new Map(base.map((doc) => [resolve(doc.path), doc]));
+	for (const update of updates) {
+		const key = resolve(update.path);
+		const previous = byPath.get(key);
+		byPath.set(key, {
+			...previous,
+			...update,
+			sha256: update.sha256 ?? previous?.sha256,
+			indexedAt: update.indexedAt ?? previous?.indexedAt,
+		});
+	}
+	return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function catalogCoversPaths(catalog: Catalog | undefined, root: string, paths: string[]): catalog is Catalog {
+	if (!catalog || catalog.partial || catalog.root !== root) return false;
+	const catalogPaths = new Set(catalog.documents.map((doc) => resolve(doc.path)));
+	if (catalogPaths.size !== paths.length) return false;
+	return paths.every((path) => catalogPaths.has(resolve(path)));
+}
+
 async function scanOnePdf(pi: ExtensionAPI, path: string, signal?: AbortSignal): Promise<CatalogDocument> {
 	const [info, id] = await Promise.all([getPdfInfo(pi, path, signal), documentId(path)]);
 	const outline = await getOutline(pi, path, 3, signal);
 	const quality = await sampleTextQuality(pi, path, info.pages, signal);
+	const indexed = await hasFreshPageCache(id, { size: info.sizeBytes, mtimeMs: info.mtimeMs });
 	return {
 		id,
 		path,
@@ -659,7 +761,7 @@ async function scanOnePdf(pi: ExtensionAPI, path: string, signal?: AbortSignal):
 		encrypted: info.encrypted,
 		hasOutline: outline.length > 0,
 		textQuality: quality,
-		indexed: await exists(pageCachePath(id)),
+		indexed,
 	};
 }
 
@@ -670,28 +772,39 @@ async function indexOnePdf(
 	signal?: AbortSignal,
 ): Promise<CatalogDocument> {
 	const [info, id] = await Promise.all([getPdfInfo(pi, path, signal), documentId(path)]);
-	const [outline, rawText] = await Promise.all([
-		getOutline(pi, path, 10, signal),
-		extractTextRange(pi, path, 1, Math.max(1, info.pages), "layout", signal),
-	]);
-	const split = splitPopplerPages(rawText);
-	const pages: CachedPage[] = [];
-	for (let page = 1; page <= Math.max(1, info.pages); page++) {
-		let text = split[page - 1] ?? "";
-		let quality = estimateTextQuality(text);
-		let ocr = false;
-		if (ocrPoorPages && (quality === "none" || quality === "poor") && text.trim().length < 200) {
-			try {
-				text = await ocrOnePage(pi, path, id, page, 300, "eng", signal);
-				quality = estimateTextQuality(text);
-				ocr = true;
-			} catch {
-				// Keep the normal extraction if OCR fails.
+	const outline = await getOutline(pi, path, 10, signal);
+	const sampleTexts: string[] = [];
+	await ensureCacheDirs();
+	// Invalidate old freshness metadata before rewriting the page cache. If
+	// extraction fails midway, future searches will not trust a partial cache.
+	await writeFile(pageCacheMetaPath(id), "", "utf8").catch(() => undefined);
+	const cachePath = pageCachePath(id);
+	await withFileMutationQueue(cachePath, async () => {
+		await writeFile(cachePath, "", "utf8");
+		for await (const chunk of extractPageChunks(pi, path, Math.max(1, info.pages), "layout", PDF_TEXT_CHUNK_SIZE, signal)) {
+			const prepared: CachedPage[] = [];
+			for (const extracted of chunk) {
+				let text = extracted.text;
+				let quality = extracted.quality ?? estimateTextQuality(text);
+				let ocr = false;
+				if (ocrPoorPages && (quality === "none" || quality === "poor") && text.trim().length < 200) {
+					try {
+						text = await ocrOnePage(pi, path, id, extracted.page, 300, "eng", signal);
+						quality = estimateTextQuality(text);
+						ocr = true;
+					} catch {
+						// Keep the normal extraction if OCR fails.
+					}
+				}
+				prepared.push({ page: extracted.page, text, layoutText: text, quality, ocr });
+				if (sampleTexts.length < 5) sampleTexts.push(text);
+			}
+			if (prepared.length > 0) {
+				await writeFile(cachePath, `${prepared.map((page) => JSON.stringify(page)).join("\n")}\n`, { encoding: "utf8", flag: "a" });
 			}
 		}
-		pages.push({ page, text, layoutText: text, quality, ocr });
-	}
-	await writeCachedPages(id, pages);
+	});
+	await writePageCacheMetadata(id, info);
 	await cacheOutline(id, outline);
 	return {
 		id,
@@ -703,32 +816,17 @@ async function indexOnePdf(
 		sha256: await sha256File(path),
 		encrypted: info.encrypted,
 		hasOutline: outline.length > 0,
-		textQuality: estimateTextQuality(pages.slice(0, Math.min(5, pages.length)).map((page) => page.text).join("\n")),
+		textQuality: estimateTextQuality(sampleTexts.join("\n")),
 		indexed: true,
 		indexedAt: nowIso(),
 	};
 }
 
-async function pagesForSearch(
-	pi: ExtensionAPI,
-	path: string,
-	doc: CatalogDocument | undefined,
-	signal?: AbortSignal,
-): Promise<{ pages: CachedPage[]; fromIndex: boolean; doc: CatalogDocument | undefined }> {
+async function readFreshCachedPagesForSearch(path: string, doc: CatalogDocument | undefined): Promise<CachedPage[] | undefined> {
 	const id = doc?.id ?? (await documentId(path));
 	const fileStat = await stat(path);
-	if (isIndexedFresh(doc, fileStat)) {
-		const cached = await readCachedPages(id);
-		if (cached) return { pages: cached, fromIndex: true, doc };
-	}
-	const info = await getPdfInfo(pi, path, signal);
-	const raw = await extractTextRange(pi, path, 1, Math.max(1, info.pages), "layout", signal);
-	const split = splitPopplerPages(raw);
-	const pages = Array.from({ length: Math.max(1, info.pages) }, (_, i) => {
-		const text = split[i] ?? "";
-		return { page: i + 1, text, layoutText: text, quality: estimateTextQuality(text) } satisfies CachedPage;
-	});
-	return { pages, fromIndex: false, doc };
+	if (!(await hasFreshPageCache(id, fileStat, doc))) return undefined;
+	return readCachedPages(id);
 }
 
 function makeLineMatcher(query: string, regex: boolean, caseSensitive: boolean): (line: string) => boolean {
@@ -893,26 +991,12 @@ async function searchPdfDocuments(
 		}
 	}
 	const catalog = await readCatalog();
-	const byPath = new Map((catalog?.documents ?? []).map((doc) => [resolve(doc.path), doc]));
+	const byPath = new Map(!catalog?.partial ? (catalog?.documents ?? []).map((doc) => [resolve(doc.path), doc]) : []);
 	const results: SearchResult[] = [];
 	let indexedDocuments = 0;
 	let directDocuments = 0;
 
-	for (const pdfPath of paths) {
-		if (results.length >= maxResults) break;
-		const doc = byPath.get(resolve(pdfPath));
-		let pages: CachedPage[];
-		let fromIndex = false;
-		try {
-			const loaded = await pagesForSearch(pi, pdfPath, doc, signal);
-			pages = loaded.pages;
-			fromIndex = loaded.fromIndex;
-		} catch {
-			continue;
-		}
-		if (fromIndex) indexedDocuments++;
-		else directDocuments++;
-
+	const appendMatches = (pdfPath: string, doc: CatalogDocument | undefined, pages: CachedPage[], fromIndex: boolean) => {
 		for (const page of pages) {
 			if (results.length >= maxResults) break;
 			const snippets = searchPage(page.text ?? page.layoutText ?? "", query, regex, caseSensitive, Math.max(0, contextLines));
@@ -926,6 +1010,28 @@ async function searchPdfDocuments(
 				});
 				if (results.length >= maxResults) break;
 			}
+		}
+	};
+
+	for (const pdfPath of paths) {
+		if (results.length >= maxResults) break;
+		const doc = byPath.get(resolve(pdfPath));
+		try {
+			const cached = await readFreshCachedPagesForSearch(pdfPath, doc);
+			if (cached) {
+				indexedDocuments++;
+				appendMatches(pdfPath, doc, cached, true);
+				continue;
+			}
+
+			directDocuments++;
+			const info = await getPdfInfo(pi, pdfPath, signal);
+			for await (const chunk of extractPageChunks(pi, pdfPath, Math.max(1, info.pages), "layout", PDF_TEXT_CHUNK_SIZE, signal)) {
+				appendMatches(pdfPath, doc, chunk, false);
+				if (results.length >= maxResults) break;
+			}
+		} catch {
+			continue;
 		}
 	}
 	return { results, indexedDocuments, directDocuments };
@@ -1042,8 +1148,21 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 			}
-			const catalog: Catalog = { version: CACHE_VERSION, root, generatedAt: nowIso(), documents: docs };
-			await writeCatalog(catalog);
+			const partialScan = selected.length !== pdfs.length;
+			const previous = await readCatalog();
+			let persistedCatalog = false;
+			let catalogDocumentCount = docs.length;
+			if (partialScan) {
+				if (catalogCoversPaths(previous, root, pdfs)) {
+					const merged = mergeCatalogDocuments(previous.documents, docs);
+					await writeCatalog({ version: CACHE_VERSION, root, generatedAt: nowIso(), documents: merged });
+					persistedCatalog = true;
+					catalogDocumentCount = merged.length;
+				}
+			} else {
+				await writeCatalog({ version: CACHE_VERSION, root, generatedAt: nowIso(), documents: docs });
+				persistedCatalog = true;
+			}
 
 			const compact = docs.map((doc) => ({
 				id: doc.id,
@@ -1056,11 +1175,11 @@ export default function (pi: ExtensionAPI) {
 				textQuality: doc.textQuality,
 				indexed: doc.indexed,
 			}));
-			const text = JSON.stringify({ root, cache: cacheRoot(), documents: compact }, null, 2);
+			const text = JSON.stringify({ root, cache: cacheRoot(), partialScan, persistedCatalog, catalogDocumentCount, documents: compact }, null, 2);
 			const truncated = truncateToolText(text, 60_000);
 			return {
 				content: [{ type: "text", text: truncated.text }],
-				details: { root, cacheRoot: cacheRoot(), documents: compact, scanned: docs.length, totalFound: pdfs.length },
+				details: { root, cacheRoot: cacheRoot(), documents: compact, scanned: docs.length, totalFound: pdfs.length, partialScan, persistedCatalog, catalogDocumentCount },
 			};
 		},
 	});
@@ -1078,8 +1197,8 @@ export default function (pi: ExtensionAPI) {
 			const outline = await getOutline(pi, path, 2, signal);
 			const quality = await sampleTextQuality(pi, path, info.pages, signal);
 			const catalog = await readCatalog();
-			const catalogDoc = catalog?.documents.find((doc) => resolve(doc.path) === resolve(path));
-			const indexed = catalogDoc ? isIndexedFresh(catalogDoc, { size: info.sizeBytes, mtimeMs: info.mtimeMs }) : await exists(pageCachePath(id));
+			const catalogDoc = !catalog?.partial ? catalog?.documents.find((doc) => resolve(doc.path) === resolve(path)) : undefined;
+			const indexed = await hasFreshPageCache(id, { size: info.sizeBytes, mtimeMs: info.mtimeMs }, catalogDoc);
 			const result = {
 				id,
 				path,
@@ -1216,7 +1335,8 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				const root = resolveUserPath(params.root ?? DEFAULT_LIBRARY_ROOT, ctx.cwd);
 				const catalog = await readCatalog();
-				paths = catalog?.root === root && catalog.documents.length > 0 ? catalog.documents.map((doc) => doc.path) : await findPdfs(root);
+				const discovered = await findPdfs(root);
+				paths = catalogCoversPaths(catalog, root, discovered) ? catalog.documents.map((doc) => doc.path) : discovered;
 			}
 			const search = await searchPdfDocuments(
 				pi,
@@ -1246,7 +1366,8 @@ export default function (pi: ExtensionAPI) {
 		const pdfs = await findPdfs(root);
 		const selected = params.maxDocuments ? pdfs.slice(0, Math.max(1, params.maxDocuments)) : pdfs;
 		const previous = await readCatalog();
-		const previousByPath = new Map((previous?.documents ?? []).map((doc) => [resolve(doc.path), doc]));
+		const previousFull = previous?.root === root && !previous.partial ? previous : undefined;
+		const previousByPath = new Map((previousFull?.documents ?? []).map((doc) => [resolve(doc.path), doc]));
 		const docs: CatalogDocument[] = [];
 		let indexed = 0;
 		let skipped = 0;
@@ -1258,8 +1379,9 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const fileStat = await stat(path);
 				const previousDoc = previousByPath.get(resolve(path));
-				if (!params.force && isIndexedFresh(previousDoc, fileStat)) {
-					docs.push(previousDoc!);
+				const docId = previousDoc?.id ?? (await documentId(path));
+				if (!params.force && (await hasFreshPageCache(docId, fileStat, previousDoc))) {
+					docs.push(previousDoc ?? (await scanOnePdf(pi, path, signal)));
 					skipped++;
 					continue;
 				}
@@ -1272,9 +1394,21 @@ export default function (pi: ExtensionAPI) {
 				if (scanned) docs.push({ ...scanned, indexed: false });
 			}
 		}
-		const catalog: Catalog = { version: CACHE_VERSION, root, generatedAt: nowIso(), documents: docs };
-		await writeCatalog(catalog);
-		const result = { root, cacheRoot: cacheRoot(), totalFound: pdfs.length, considered: selected.length, indexed, skipped, failed, failures };
+		const partialRun = selected.length !== pdfs.length;
+		let persistedCatalog = false;
+		let catalogDocumentCount = docs.length;
+		if (partialRun) {
+			if (catalogCoversPaths(previousFull, root, pdfs)) {
+				const merged = mergeCatalogDocuments(previousFull.documents, docs);
+				await writeCatalog({ version: CACHE_VERSION, root, generatedAt: nowIso(), documents: merged });
+				persistedCatalog = true;
+				catalogDocumentCount = merged.length;
+			}
+		} else {
+			await writeCatalog({ version: CACHE_VERSION, root, generatedAt: nowIso(), documents: docs });
+			persistedCatalog = true;
+		}
+		const result = { root, cacheRoot: cacheRoot(), totalFound: pdfs.length, considered: selected.length, indexed, skipped, failed, failures, partialRun, persistedCatalog, catalogDocumentCount };
 		return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
 	}
 
@@ -1394,19 +1528,36 @@ export default function (pi: ExtensionAPI) {
 			const dir = join(cacheRoot(), "images", id);
 			await mkdir(dir, { recursive: true });
 			const groups = groupContiguous(pages);
-			const allMetadata: ReturnType<typeof parsePdfImagesList> = [];
-			const before = new Set(await readdir(dir).catch(() => []));
+			const imageExtensions = new Set([".png", ".jpg", ".jpeg", ".jp2", ".ppm", ".pbm", ".pgm"]);
+			const metadata: Array<ReturnType<typeof parsePdfImagesList>[number] & { imagePath?: string }> = [];
+			const imagePathsSet = new Set<string>();
 			for (const group of groups) {
 				const listArgs = ["-list", "-f", String(group.first), "-l", String(group.last), path];
 				const list = await runCommand(pi, "pdfimages", listArgs, signal, 120_000).catch(() => ({ stdout: "" }));
-				allMetadata.push(...parsePdfImagesList(list.stdout));
-				await runCommand(pi, "pdfimages", ["-png", "-f", String(group.first), "-l", String(group.last), path, join(dir, `pages-${group.first}-${group.last}`)], signal, 240_000).catch(() => undefined);
+				const groupMetadata = parsePdfImagesList(list.stdout);
+				const prefix = join(dir, `pages-${group.first}-${group.last}`);
+				const prefixBase = basename(prefix);
+				await runCommand(pi, "pdfimages", ["-png", "-f", String(group.first), "-l", String(group.last), path, prefix], signal, 240_000).catch(() => undefined);
+				const files = (await readdir(dir))
+					.filter((name) => name.startsWith(`${prefixBase}-`) && imageExtensions.has(name.slice(name.lastIndexOf(".")).toLowerCase()))
+					.sort();
+
+				if (groupMetadata.length === 0) {
+					if (!params.minWidth && !params.minHeight) {
+						for (const file of files) imagePathsSet.add(join(dir, file));
+					}
+					continue;
+				}
+
+				groupMetadata.forEach((item, index) => {
+					if (params.minWidth && (item.width ?? 0) < params.minWidth) return;
+					if (params.minHeight && (item.height ?? 0) < params.minHeight) return;
+					const imagePath = files[index] ? join(dir, files[index]) : undefined;
+					metadata.push({ ...item, imagePath });
+					if (imagePath) imagePathsSet.add(imagePath);
+				});
 			}
-			let metadata = allMetadata;
-			if (params.minWidth) metadata = metadata.filter((item) => (item.width ?? 0) >= params.minWidth!);
-			if (params.minHeight) metadata = metadata.filter((item) => (item.height ?? 0) >= params.minHeight!);
-			const after = await readdir(dir);
-			const imagePaths = after.filter((name) => !before.has(name)).map((name) => join(dir, name));
+			const imagePaths = [...imagePathsSet].sort();
 			const result = { path, pages: pagesToRangeString(pages), outputDir: dir, imagePaths, metadata };
 			return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
 		},
