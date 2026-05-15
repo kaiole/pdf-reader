@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { access, mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 import {
 	DEFAULT_MAX_BYTES,
@@ -15,7 +15,13 @@ import {
 export * from "./constants";
 export * from "./types";
 
-import { CACHE_VERSION, DEFAULT_EXTRACT_MAX_CHARS, HARD_EXTRACT_MAX_CHARS, PDF_TEXT_CHUNK_SIZE } from "./constants";
+import {
+	CACHE_VERSION,
+	DEFAULT_EXTRACT_MAX_CHARS,
+	HARD_EXTRACT_MAX_CHARS,
+	PDF_TEXT_CHUNK_SIZE,
+	SEARCH_PAGE_MATCH_LIMIT,
+} from "./constants";
 import type {
 	CachedPage,
 	Catalog,

@@ -1,4 +1,4 @@
-import { mkdir, readdir } from "node:fs/promises";
+import { mkdir, readdir, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -6,6 +6,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import {
+	CACHE_VERSION,
 	DEFAULT_LIBRARY_ROOT,
 	DEFAULT_EXTRACT_MAX_CHARS,
 	HARD_EXTRACT_MAX_CHARS,
@@ -15,6 +16,8 @@ import {
 	catalogCoversPaths,
 	documentId,
 	ensureCacheDirs,
+	estimateTextQuality,
+	exists,
 	extractPages,
 	findPdfs,
 	formatExtractedPages,
@@ -27,6 +30,7 @@ import {
 	indexOnePdf,
 	mergeCatalogDocuments,
 	ocrDir,
+	nowIso,
 	ocrOnePage,
 	pagesToRangeString,
 	parsePageSpec,
@@ -41,7 +45,9 @@ import {
 	truncateToolText,
 	writeCatalog,
 	readCatalog,
+	runCommand,
 } from "./core";
+import type { CatalogDocument, ResolvedReference, TextQuality } from "./core";
 
 const pathSchema = Type.Object({
 	path: Type.String({ description: "Path to a PDF file. Relative paths are resolved from the current working directory; leading @ is accepted." }),
