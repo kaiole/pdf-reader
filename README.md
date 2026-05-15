@@ -22,6 +22,7 @@ Pi extension for reading technical PDFs with Poppler/qpdf/Tesseract tools.
 - `src/core.ts` — PDF/cache/search/render/OCR backend helpers.
 - `src/constants.ts` — defaults and limits.
 - `src/types.ts` — shared TypeScript types.
+- `skills/pdf-reading/SKILL.md` — workflow skill for PDF reading/searching/summarization.
 
 ## Requirements
 
