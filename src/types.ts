@@ -62,11 +62,15 @@ export type PageCacheMetadata = {
 	sizeBytes: number;
 	mtimeMs: number;
 	indexedAt: string;
+	fingerprint: string;
+	/** Immutable generation file selected by this atomically published manifest. */
+	dataFile?: string;
 };
 
 export type CachedPage = {
 	page: number;
 	text: string;
+	/** Legacy cache field; new caches persist only authoritative text. */
 	layoutText?: string;
 	quality?: TextQuality;
 	ocr?: boolean;
@@ -78,6 +82,11 @@ export type SearchResult = {
 	page: number;
 	snippet: string;
 	score?: number;
+};
+
+export type PageLabel = {
+	page: number;
+	label: string;
 };
 
 export type ResolvedReference = {

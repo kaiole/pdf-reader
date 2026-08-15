@@ -1,13 +1,12 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { access, mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
-	truncateHead,
 	type ExtensionAPI,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
@@ -19,15 +18,19 @@ import {
 	CACHE_VERSION,
 	DEFAULT_EXTRACT_MAX_CHARS,
 	HARD_EXTRACT_MAX_CHARS,
+	MAX_PAGES_PER_OPERATION,
 	PDF_TEXT_CHUNK_SIZE,
 	SEARCH_PAGE_MATCH_LIMIT,
 } from "./constants";
+import { hasFreshSqliteDocument, replaceSqliteDocument, searchSqliteIndex, sqliteDocumentStates } from "./index-db";
+
 import type {
 	CachedPage,
 	Catalog,
 	CatalogDocument,
 	FlatOutlineEntry,
 	OutlineEntry,
+	PageLabel,
 	PageCacheMetadata,
 	PdfInfo,
 	ResolvedReference,
@@ -88,10 +91,44 @@ export function ocrDir(docId: string, root = cacheRoot()): string {
 }
 
 export async function ensureCacheDirs(root = cacheRoot()): Promise<void> {
-	await mkdir(join(root, "pages"), { recursive: true });
-	await mkdir(join(root, "outlines"), { recursive: true });
-	await mkdir(join(root, "renders"), { recursive: true });
-	await mkdir(join(root, "ocr"), { recursive: true });
+	await mkdir(root, { recursive: true, mode: 0o700 });
+	await chmod(root, 0o700).catch(() => undefined);
+	for (const name of ["pages", "outlines", "renders", "ocr", "images"]) {
+		const path = join(root, name);
+		await mkdir(path, { recursive: true, mode: 0o700 });
+		await chmod(path, 0o700).catch(() => undefined);
+	}
+}
+
+async function atomicWriteJsonLines(path: string, values: unknown[]): Promise<void> {
+	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+	const temp = `${path}.tmp-${process.pid}-${Date.now()}`;
+	const file = await open(temp, "wx", 0o600);
+	try {
+		for (const value of values) await file.write(`${JSON.stringify(value)}\n`);
+		await file.sync();
+		await file.close();
+		await rename(temp, path);
+	} catch (error) {
+		await file.close().catch(() => undefined);
+		await rm(temp, { force: true });
+		throw error;
+	}
+}
+
+async function atomicWrite(path: string, content: string): Promise<void> {
+	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+	const temp = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	try {
+		await writeFile(temp, content, { encoding: "utf8", mode: 0o600 });
+		await rename(temp, path);
+	} finally {
+		await rm(temp, { force: true }).catch(() => undefined);
+	}
+}
+
+export async function sourceFingerprint(path: string): Promise<string> {
+	return sha256File(path);
 }
 
 export async function exists(path: string): Promise<boolean> {
@@ -169,8 +206,9 @@ export async function runCommand(
 	const stderr = result.stderr ?? "";
 	const code = result.code ?? (result.killed ? 1 : 0);
 	if (code !== 0) {
-		const detail = (stderr || stdout || `exit code ${code}`).trim();
-		throw new Error(`${command} failed: ${detail}`);
+		const rawDetail = (stderr || stdout || `exit code ${code}`).trim();
+		const detail = Buffer.from(rawDetail).subarray(0, 4_000).toString("utf8").replace(/\uFFFD$/u, "");
+		throw new Error(`${command} failed: ${detail}${Buffer.byteLength(rawDetail) > 4_000 ? "\n[diagnostic truncated]" : ""}`);
 	}
 	return { stdout, stderr, code, killed: result.killed };
 }
@@ -263,15 +301,60 @@ export function parseOutlineNode(node: any, depth: number, maxDepth: number): Ou
 }
 
 export async function getOutline(pi: ExtensionAPI, path: string, maxDepth = 10, signal?: AbortSignal): Promise<OutlineEntry[]> {
-	try {
-		const { stdout } = await runCommand(pi, "qpdf", ["--json", "--json-key=outlines", path], signal, 120_000);
-		const json = JSON.parse(stdout) as { outlines?: any[] };
-		return (json.outlines ?? [])
-			.map((node) => parseOutlineNode(node, 1, Math.max(1, maxDepth)))
-			.filter(Boolean) as OutlineEntry[];
-	} catch {
-		return [];
+	const { stdout } = await runCommand(pi, "qpdf", ["--json", "--json-key=outlines", path], signal, 120_000);
+	let json: { outlines?: unknown };
+	try { json = JSON.parse(stdout) as { outlines?: unknown }; }
+	catch (error: any) { throw new Error(`qpdf returned malformed outline JSON for ${path}: ${error?.message ?? error}`); }
+	if (json.outlines !== undefined && !Array.isArray(json.outlines)) throw new Error(`qpdf returned an invalid outline structure for ${path}`);
+	return ((json.outlines ?? []) as any[])
+		.map((node) => parseOutlineNode(node, 1, Math.max(1, maxDepth)))
+		.filter(Boolean) as OutlineEntry[];
+}
+
+export function parsePageLabels(json: any, pageCount: number): PageLabel[] {
+	const ranges = Array.isArray(json?.pagelabels) ? json.pagelabels : [];
+	if (ranges.length === 0) return [];
+	const sorted = ranges
+		.map((item: any) => ({ index: Number(item?.index), spec: item?.label ?? {} }))
+		.filter((item: any) => Number.isInteger(item.index) && item.index >= 0 && item.index < pageCount)
+		.sort((a: any, b: any) => a.index - b.index);
+	const roman = (value: number, upper: boolean) => {
+		const table: Array<[number, string]> = [[1000,"M"],[900,"CM"],[500,"D"],[400,"CD"],[100,"C"],[90,"XC"],[50,"L"],[40,"XL"],[10,"X"],[9,"IX"],[5,"V"],[4,"IV"],[1,"I"]];
+		let n = value, out = "";
+		for (const [amount, symbol] of table) while (n >= amount) { out += symbol; n -= amount; }
+		return upper ? out : out.toLowerCase();
+	};
+	const alpha = (value: number, upper: boolean) => {
+		let n = value, out = "";
+		while (n > 0) { n--; out = String.fromCharCode(65 + n % 26) + out; n = Math.floor(n / 26); }
+		return upper ? out : out.toLowerCase();
+	};
+	const result: PageLabel[] = [];
+	for (let r = 0; r < sorted.length; r++) {
+		const { index, spec } = sorted[r]!;
+		const end = Math.min(pageCount, sorted[r + 1]?.index ?? pageCount);
+		const get = (key: string) => spec[key] ?? spec[`/${key}`];
+		const decodeQpdfString = (value: unknown) => {
+			const text = String(value ?? "");
+			if (text.startsWith("u:")) return text.slice(2);
+			if (text.startsWith("b:")) {
+				try { return Buffer.from(text.slice(2), "hex").toString("latin1"); } catch { return text.slice(2); }
+			}
+			return text;
+		};
+		for (let offset = 0; index + offset < end; offset++) {
+			const value = Number(get("St") ?? 1) + offset;
+			const style = String(get("S") ?? "").replace(/^\//, "");
+			const suffix = style === "D" ? String(value) : style === "R" ? roman(value, true) : style === "r" ? roman(value, false) : style === "A" ? alpha(value, true) : style === "a" ? alpha(value, false) : "";
+			result.push({ page: index + offset + 1, label: `${decodeQpdfString(get("P"))}${suffix}` });
+		}
 	}
+	return result.filter((item) => item.label.length > 0);
+}
+
+export async function getPageLabels(pi: ExtensionAPI, path: string, pageCount: number, signal?: AbortSignal): Promise<PageLabel[]> {
+	const { stdout } = await runCommand(pi, "qpdf", ["--json", "--json-key=pagelabels", path], signal, 120_000);
+	return parsePageLabels(JSON.parse(stdout), pageCount);
 }
 
 export function flattenOutline(entries: OutlineEntry[]): FlatOutlineEntry[] {
@@ -318,34 +401,40 @@ export function pagesToRangeString(pages: number[]): string {
 	return parts.join(",");
 }
 
-export function parsePageSpec(spec: string, pageCount?: number): number[] {
+export function parsePageSpec(spec: string, pageCount?: number, maxPages = MAX_PAGES_PER_OPERATION): number[] {
 	const trimmed = spec.trim().toLowerCase();
+	if (!trimmed) throw new Error("Page specification must not be empty.");
 	if (trimmed === "all" || trimmed === "*") {
 		if (!pageCount || pageCount <= 0) throw new Error("Cannot use pages=all without knowing the PDF page count.");
+		if (pageCount > maxPages) throw new Error(`Page request resolves to ${pageCount} pages; maximum per operation is ${maxPages}.`);
 		return Array.from({ length: pageCount }, (_, i) => i + 1);
 	}
-
-	const pages = new Set<number>();
+	const intervals: Array<[number, number]> = [];
 	for (const rawPart of trimmed.split(/[,+]/)) {
 		const part = rawPart.trim();
 		if (!part) continue;
-		const range = part.match(/^(\d+)\s*[-–—]\s*(\d+)$/);
-		if (range) {
-			let start = Number.parseInt(range[1], 10);
-			let end = Number.parseInt(range[2], 10);
-			if (end < start) [start, end] = [end, start];
-			for (let page = start; page <= end; page++) pages.add(page);
-			continue;
+		const match = part.match(/^(\d+)(?:\s*[-–—]\s*(\d+))?$/);
+		if (!match) throw new Error(`Invalid page spec segment: ${rawPart}`);
+		let start = Number(match[1]), end = Number(match[2] ?? match[1]);
+		if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < 1) throw new Error(`Invalid page spec segment: ${rawPart}`);
+		if (end < start) [start, end] = [end, start];
+		const rawSpan = end - start + 1;
+		if (rawSpan > Math.max(maxPages * 100, (pageCount ?? 0) * 100)) throw new Error(`Pathological PDF page range ${start}-${end} is too large to process.`);
+		if (pageCount) {
+			if (start > pageCount) throw new Error(`PDF page range ${start}-${end} is outside the valid range 1-${pageCount}.`);
+			end = Math.min(end, pageCount);
 		}
-		if (!/^\d+$/.test(part)) throw new Error(`Invalid page spec segment: ${rawPart}`);
-		const single = Number.parseInt(part, 10);
-		if (!Number.isFinite(single) || single <= 0) throw new Error(`Invalid page spec segment: ${rawPart}`);
-		pages.add(single);
+		intervals.push([start, end]);
 	}
-
-	const result = [...pages].filter((page) => page > 0).sort((a, b) => a - b);
-	if (pageCount && pageCount > 0) return result.filter((page) => page <= pageCount);
-	return result;
+	let requested = 0;
+	for (const [start, end] of intervals) {
+		requested += end - start + 1;
+		if (requested > maxPages) throw new Error(`Page request exceeds the maximum of ${maxPages} pages per operation.`);
+	}
+	const pages = new Set<number>();
+	for (const [start, end] of intervals) for (let page = start; page <= end; page++) pages.add(page);
+	if (pages.size > maxPages) throw new Error(`Page request exceeds the maximum of ${maxPages} pages per operation.`);
+	return [...pages].sort((a, b) => a - b);
 }
 
 export function groupContiguous(pages: number[]): Array<{ first: number; last: number }> {
@@ -455,7 +544,7 @@ export async function extractPages(
 		const parts = splitPopplerPages(raw);
 		for (let page = group.first; page <= group.last; page++) {
 			const text = parts[page - group.first] ?? "";
-			result.push({ page, text, layoutText: extractionMode === "layout" ? text : undefined, quality: estimateTextQuality(text) });
+			result.push({ page, text, quality: estimateTextQuality(text) });
 		}
 	}
 	return result;
@@ -477,7 +566,7 @@ async function* extractPageChunks(
 		yield Array.from({ length: last - first + 1 }, (_, index) => {
 			const page = first + index;
 			const text = split[index] ?? "";
-			return { page, text, layoutText: mode === "layout" ? text : undefined, quality: estimateTextQuality(text) };
+			return { page, text, quality: estimateTextQuality(text) };
 		});
 	}
 }
@@ -507,28 +596,30 @@ export function formatExtractedPages(path: string, pages: CachedPage[], mode: "p
 
 export function truncateToolText(text: string, maxChars?: number): { text: string; truncated: boolean; omittedChars: number } {
 	const charLimit = Math.max(1_000, Math.min(HARD_EXTRACT_MAX_CHARS, maxChars ?? DEFAULT_EXTRACT_MAX_CHARS));
-	const byteLimit = Math.max(4_096, Math.min(Math.max(DEFAULT_MAX_BYTES, charLimit * 2), HARD_EXTRACT_MAX_CHARS * 2));
-	const truncated = truncateHead(text, { maxLines: DEFAULT_MAX_LINES, maxBytes: byteLimit });
-	let out = truncated.content;
-	if (out.length > charLimit) out = out.slice(0, charLimit);
-	const wasTruncated = out.length < text.length || truncated.truncated;
+	const byteLimit = Math.min(DEFAULT_MAX_BYTES, 50_000);
+	const lineLimit = Math.min(DEFAULT_MAX_LINES, 2_000);
+	const withinLimits = text.length <= charLimit && Buffer.byteLength(text) <= byteLimit && text.split("\n").length <= lineLimit;
+	if (withinLimits) return { text, truncated: false, omittedChars: 0 };
+	const notice = "[Output truncated. Request a narrower page range or continue with explicit later pages.]";
+	const contentLineLimit = Math.max(1, lineLimit - 1);
+	let out = text.split("\n").slice(0, contentLineLimit).join("\n").slice(0, Math.max(0, charLimit - notice.length - 1));
+	const contentByteLimit = byteLimit - Buffer.byteLength(notice) - 1;
+	if (Buffer.byteLength(out) > contentByteLimit) out = Buffer.from(out).subarray(0, contentByteLimit).toString("utf8").replace(/\uFFFD$/, "");
+	out = out.trimEnd();
 	const omittedChars = Math.max(0, text.length - out.length);
-	if (!wasTruncated) return { text, truncated: false, omittedChars: 0 };
-	return {
-		text: `${out.trimEnd()}\n\n[Output truncated: omitted about ${omittedChars.toLocaleString()} characters. Request a narrower page range or increase maxChars up to ${HARD_EXTRACT_MAX_CHARS}.]`,
-		truncated: true,
-		omittedChars,
-	};
+	return { text: `${out}\n${notice}`, truncated: true, omittedChars };
 }
 
 export async function findPdfs(root: string): Promise<string[]> {
+	const rootStat = await stat(root).catch((error: any) => { throw new Error(`PDF library root is missing or unreadable: ${root}: ${error.message}`); });
+	if (!rootStat.isDirectory()) throw new Error(`PDF library root is not a directory: ${root}`);
 	const results: string[] = [];
 	async function walk(dir: string): Promise<void> {
 		let entries;
 		try {
 			entries = await readdir(dir, { withFileTypes: true });
-		} catch {
-			return;
+		} catch (error: any) {
+			throw new Error(`Cannot read PDF library directory ${dir}: ${error.message}`);
 		}
 		for (const entry of entries) {
 			if (entry.name.startsWith(".") && entry.isDirectory()) continue;
@@ -558,7 +649,7 @@ export async function writeCatalog(catalog: Catalog, root = cacheRoot()): Promis
 	await ensureCacheDirs(root);
 	const path = catalogPath(root);
 	await withFileMutationQueue(path, async () => {
-		await writeFile(path, `${JSON.stringify(catalog, null, 2)}\n`, "utf8");
+		await atomicWrite(path, `${JSON.stringify(catalog, null, 2)}\n`);
 	});
 }
 
@@ -573,7 +664,7 @@ export async function readPageCacheMetadata(docId: string, root = cacheRoot()): 
 
 export async function writePageCacheMetadata(
 	docId: string,
-	source: Pick<PdfInfo, "path" | "pages" | "sizeBytes" | "mtimeMs">,
+	source: Pick<PdfInfo, "path" | "pages" | "sizeBytes" | "mtimeMs"> & { fingerprint: string },
 	root = cacheRoot(),
 ): Promise<void> {
 	await ensureCacheDirs(root);
@@ -585,14 +676,16 @@ export async function writePageCacheMetadata(
 		sizeBytes: source.sizeBytes,
 		mtimeMs: source.mtimeMs,
 		indexedAt: nowIso(),
+		fingerprint: source.fingerprint,
 	};
 	await withFileMutationQueue(path, async () => {
-		await writeFile(path, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+		await atomicWrite(path, `${JSON.stringify(metadata, null, 2)}\n`);
 	});
 }
 
-export async function readCachedPages(docId: string, root = cacheRoot()): Promise<CachedPage[] | undefined> {
-	const path = pageCachePath(docId, root);
+export async function readCachedPages(docId: string, root = cacheRoot(), metadata?: PageCacheMetadata): Promise<CachedPage[] | undefined> {
+	const manifest = metadata ?? await readPageCacheMetadata(docId, root);
+	const path = manifest?.dataFile ? join(root, "pages", manifest.dataFile) : pageCachePath(docId, root);
 	try {
 		const content = await readFile(path, "utf8");
 		return content
@@ -604,18 +697,16 @@ export async function readCachedPages(docId: string, root = cacheRoot()): Promis
 	}
 }
 
-export async function cacheOutline(docId: string, outline: OutlineEntry[], root = cacheRoot()): Promise<void> {
+export async function cacheOutline(docId: string, fingerprint: string, outline: OutlineEntry[], root = cacheRoot()): Promise<void> {
 	await ensureCacheDirs(root);
 	const path = outlineCachePath(docId, root);
-	await withFileMutationQueue(path, async () => {
-		await writeFile(path, `${JSON.stringify(outline, null, 2)}\n`, "utf8");
-	});
+	await withFileMutationQueue(path, async () => atomicWrite(path, `${JSON.stringify({ version: CACHE_VERSION, fingerprint, outline }, null, 2)}\n`));
 }
 
-export async function loadCachedOutline(docId: string, root = cacheRoot()): Promise<OutlineEntry[] | undefined> {
+export async function loadCachedOutline(docId: string, fingerprint: string, root = cacheRoot()): Promise<OutlineEntry[] | undefined> {
 	try {
-		const outline = JSON.parse(await readFile(outlineCachePath(docId, root), "utf8"));
-		return Array.isArray(outline) ? (outline as OutlineEntry[]) : undefined;
+		const cached = JSON.parse(await readFile(outlineCachePath(docId, root), "utf8"));
+		return cached?.version === CACHE_VERSION && cached?.fingerprint === fingerprint && Array.isArray(cached.outline) ? cached.outline : undefined;
 	} catch {
 		return undefined;
 	}
@@ -624,7 +715,7 @@ export async function loadCachedOutline(docId: string, root = cacheRoot()): Prom
 export function isIndexedFresh(doc: CatalogDocument | undefined, fileStat: { size: number; mtimeMs: number }): boolean {
 	if (!doc?.indexed) return false;
 	if (doc.sizeBytes !== fileStat.size) return false;
-	if (Math.abs(doc.mtimeMs - fileStat.mtimeMs) > 2_000) return false;
+	if (doc.mtimeMs !== fileStat.mtimeMs) return false;
 	return true;
 }
 
@@ -634,17 +725,16 @@ export async function hasFreshPageCache(
 	doc?: CatalogDocument,
 	root = cacheRoot(),
 ): Promise<boolean> {
-	if (!(await exists(pageCachePath(docId, root)))) return false;
-	const metadataPath = pageCacheMetaPath(docId, root);
-	const metadataFileExists = await exists(metadataPath);
-	const metadata = metadataFileExists ? await readPageCacheMetadata(docId, root) : undefined;
-	if (metadataFileExists) {
-		if (!metadata) return false;
-		if (metadata.sizeBytes !== fileStat.size) return false;
-		if (Math.abs(metadata.mtimeMs - fileStat.mtimeMs) > 2_000) return false;
-		return true;
+	const metadata = await readPageCacheMetadata(docId, root);
+	if (metadata) {
+		const dataPath = metadata.dataFile ? join(root, "pages", metadata.dataFile) : pageCachePath(docId, root);
+		if (!(await exists(dataPath))) return false;
+		if (metadata.sizeBytes !== fileStat.size || metadata.mtimeMs !== fileStat.mtimeMs) return false;
+		return metadata.fingerprint === await sourceFingerprint(metadata.path);
 	}
-	return isIndexedFresh(doc, fileStat);
+	if (!(await exists(pageCachePath(docId, root)))) return false;
+	if (!isIndexedFresh(doc, fileStat) || !doc?.sha256) return false;
+	return doc.sha256 === await sourceFingerprint(doc.path);
 }
 
 export function mergeCatalogDocuments(base: CatalogDocument[], updates: CatalogDocument[]): CatalogDocument[] {
@@ -688,68 +778,60 @@ export async function scanOnePdf(pi: ExtensionAPI, path: string, signal?: AbortS
 	};
 }
 
-export async function indexOnePdf(
-	pi: ExtensionAPI,
-	path: string,
-	ocrPoorPages: boolean,
-	signal?: AbortSignal,
-): Promise<CatalogDocument> {
-	const [info, id] = await Promise.all([getPdfInfo(pi, path, signal), documentId(path)]);
-	const outline = await getOutline(pi, path, 10, signal);
-	const sampleTexts: string[] = [];
+export async function indexOnePdf(pi: ExtensionAPI, path: string, ocrPoorPages: boolean, signal?: AbortSignal): Promise<CatalogDocument> {
+	const id = await documentId(path);
 	await ensureCacheDirs();
-	// Invalidate old freshness metadata before rewriting the page cache. If
-	// extraction fails midway, future searches will not trust a partial cache.
-	await writeFile(pageCacheMetaPath(id), "", "utf8").catch(() => undefined);
-	const cachePath = pageCachePath(id);
-	await withFileMutationQueue(cachePath, async () => {
-		await writeFile(cachePath, "", "utf8");
+	// One queue key covers extraction, source revalidation, and publication.
+	return withFileMutationQueue(pageCacheMetaPath(id), async () => {
+		const info = await getPdfInfo(pi, path, signal);
+		const fingerprint = await sourceFingerprint(path);
+		const outline = await getOutline(pi, path, 10, signal);
+		let ocrReady = false;
+		if (ocrPoorPages) { try { await assertTesseractLanguage(pi, "eng", signal); ocrReady = true; } catch { /* indexing still preserves extracted text */ } }
+		const sampleTexts: string[] = [];
+		const cachedPages: CachedPage[] = [];
 		for await (const chunk of extractPageChunks(pi, path, Math.max(1, info.pages), "layout", PDF_TEXT_CHUNK_SIZE, signal)) {
-			const prepared: CachedPage[] = [];
 			for (const extracted of chunk) {
 				let text = extracted.text;
 				let quality = extracted.quality ?? estimateTextQuality(text);
 				let ocr = false;
-				if (ocrPoorPages && (quality === "none" || quality === "poor") && text.trim().length < 200) {
-					try {
-						text = await ocrOnePage(pi, path, id, extracted.page, 300, "eng", signal);
-						quality = estimateTextQuality(text);
-						ocr = true;
-					} catch {
-						// Keep the normal extraction if OCR fails.
-					}
+				if (ocrReady && (quality === "none" || quality === "poor") && text.trim().length < 200) {
+					try { text = await ocrOnePage(pi, path, id, extracted.page, 300, "eng", signal, fingerprint, true); quality = estimateTextQuality(text); ocr = true; } catch { /* retain extracted text */ }
 				}
-				prepared.push({ page: extracted.page, text, layoutText: text, quality, ocr });
+				const cachedPage = { page: extracted.page, text, quality, ocr } satisfies CachedPage;
+				cachedPages.push(cachedPage);
 				if (sampleTexts.length < 5) sampleTexts.push(text);
 			}
-			if (prepared.length > 0) {
-				await writeFile(cachePath, `${prepared.map((page) => JSON.stringify(page)).join("\n")}\n`, { encoding: "utf8", flag: "a" });
-			}
 		}
+		const current = await stat(path);
+		const currentFingerprint = await sourceFingerprint(path);
+		if (current.size !== info.sizeBytes || current.mtimeMs !== info.mtimeMs || currentFingerprint !== fingerprint) throw new Error(`PDF changed while indexing; previous valid cache retained: ${path}`);
+		const previousMetadata = await readPageCacheMetadata(id);
+		const generation = `${id}.${fingerprint}.${Date.now()}.jsonl`;
+		const metadata: PageCacheMetadata = { version: CACHE_VERSION, path: info.path, pages: info.pages, sizeBytes: info.sizeBytes, mtimeMs: info.mtimeMs, indexedAt: nowIso(), fingerprint, dataFile: generation };
+		// Publish immutable data first and switch readers with one atomic manifest rename.
+		await atomicWriteJsonLines(join(dirname(pageCachePath(id)), generation), cachedPages);
+		await atomicWrite(pageCacheMetaPath(id), `${JSON.stringify(metadata, null, 2)}\n`);
+		await cacheOutline(id, fingerprint, outline);
+		const document = { id, path, title: info.title, pages: info.pages, sizeBytes: info.sizeBytes, mtimeMs: info.mtimeMs, sha256: fingerprint, encrypted: info.encrypted, hasOutline: outline.length > 0, textQuality: estimateTextQuality(sampleTexts.join("\n")), indexed: true, indexedAt: metadata.indexedAt } satisfies CatalogDocument;
+		replaceSqliteDocument(cacheRoot(), document, fingerprint, cachedPages);
+		// Keep the current and immediately previous immutable generations; older
+		// files are no longer reachable after both publications succeeded.
+		const keep = new Set([generation, previousMetadata?.dataFile].filter(Boolean));
+		for (const name of await readdir(dirname(pageCachePath(id)))) {
+			if (name.startsWith(`${id}.`) && name.endsWith(".jsonl") && !keep.has(name)) await rm(join(dirname(pageCachePath(id)), name), { force: true });
+		}
+		return document;
 	});
-	await writePageCacheMetadata(id, info);
-	await cacheOutline(id, outline);
-	return {
-		id,
-		path,
-		title: info.title,
-		pages: info.pages,
-		sizeBytes: info.sizeBytes,
-		mtimeMs: info.mtimeMs,
-		sha256: await sha256File(path),
-		encrypted: info.encrypted,
-		hasOutline: outline.length > 0,
-		textQuality: estimateTextQuality(sampleTexts.join("\n")),
-		indexed: true,
-		indexedAt: nowIso(),
-	};
 }
 
 export async function readFreshCachedPagesForSearch(path: string, doc: CatalogDocument | undefined): Promise<CachedPage[] | undefined> {
 	const id = doc?.id ?? (await documentId(path));
 	const fileStat = await stat(path);
 	if (!(await hasFreshPageCache(id, fileStat, doc))) return undefined;
-	return readCachedPages(id);
+	const metadata = await readPageCacheMetadata(id);
+	if (!metadata || metadata.fingerprint !== await sourceFingerprint(path)) return undefined;
+	return readCachedPages(id, cacheRoot(), metadata);
 }
 
 export function makeLineMatcher(query: string, regex: boolean, caseSensitive: boolean): (line: string) => boolean {
@@ -786,10 +868,12 @@ export function searchPage(
 	return matches;
 }
 
-export function formatSearchResults(query: string, results: SearchResult[], fromIndex: number, direct: number): string {
+export function formatSearchResults(query: string, results: SearchResult[], fromIndex: number, direct: number, failures: Array<{ path: string; error: string }> = [], stale = 0): string {
 	if (results.length === 0) {
 		const note = direct > 0 ? " Direct extraction was used for some unindexed PDFs; build an index for faster repeated searches." : "";
-		return `No PDF matches found for ${JSON.stringify(query)}.${note}`;
+		const staleNote = stale ? ` ${stale} stale index document(s) detected${direct > 0 ? " and direct extraction was attempted" : " but the result limit prevented direct fallback"}; run /pdf-index update.` : "";
+		const failureNote = failures.length ? ` ${failures.length} document(s) failed: ${failures.slice(0, 5).map((item) => `${item.path}: ${item.error}`).join("; ")}` : "";
+		return `No PDF matches found for ${JSON.stringify(query)}.${note}${staleNote}${failureNote}`;
 	}
 	const lines = [`Found ${results.length} PDF match${results.length === 1 ? "" : "es"} for ${JSON.stringify(query)}:`];
 	results.forEach((result, index) => {
@@ -797,7 +881,8 @@ export function formatSearchResults(query: string, results: SearchResult[], from
 		lines.push(`\n${index + 1}. ${result.path}${title} :: PDF page ${result.page}`);
 		lines.push(result.snippet);
 	});
-	lines.push(`\n[Search sources: ${fromIndex} indexed document(s), ${direct} direct extraction document(s). Cache: ${cacheRoot()}]`);
+	lines.push(`\n[Search sources: ${fromIndex} indexed document(s), ${direct} direct extraction document(s), ${stale} stale index document(s), ${failures.length} failed document(s). Cache: ${cacheRoot()}]`);
+	if (failures.length) lines.push(`[Failures: ${failures.slice(0, 10).map((item) => `${item.path}: ${item.error}`).join("; ")}${failures.length > 10 ? "; additional failures omitted" : ""}]`);
 	return lines.join("\n");
 }
 
@@ -852,14 +937,36 @@ export async function resolveReferenceInternal(
 	signal?: AbortSignal,
 ): Promise<ResolvedReference> {
 	const info = await getPdfInfo(pi, path, signal);
-	const directPage = reference.match(/(?:pdf\s*)?page\s+(\d+)/i)?.[1] ?? reference.match(/^\s*(\d+)\s*$/)?.[1];
-	if (directPage) {
-		const page = Math.min(Math.max(1, Number.parseInt(directPage, 10)), Math.max(1, info.pages));
-		return { pages: String(page), confidence: "high", method: "heuristic", notes: "Interpreted as a PDF page number." };
+	const explicitPdfPage = reference.match(/^\s*pdf\s*page\s+(\d+)\s*$/i)?.[1];
+	if (explicitPdfPage) {
+		const page = Number(explicitPdfPage);
+		if (page < 1 || page > info.pages) throw new Error(`PDF page ${page} is outside the valid range 1-${info.pages}.`);
+		return { pages: String(page), confidence: "high", method: "heuristic", notes: "Explicit PDF page number." };
+	}
+	const labelMatch = reference.match(/^\s*((?:printed|labeled?)\s+)?page\s+(.+?)\s*$/i);
+	const labelReference = labelMatch?.[2];
+	if (labelReference) {
+		const explicitlyLabeled = Boolean(labelMatch?.[1]);
+		const labels = await getPageLabels(pi, path, info.pages, signal).catch(() => []);
+		const matches = labels.filter((item) => item.label.toLowerCase() === labelReference.toLowerCase());
+		if (matches.length === 1) return { pages: String(matches[0]!.page), confidence: explicitlyLabeled ? "high" : "low", method: "page-label", notes: `${explicitlyLabeled ? "Explicit" : "Ambiguous unqualified"} page label ${JSON.stringify(matches[0]!.label)} maps to PDF page ${matches[0]!.page}.` };
+		if (matches.length > 1) return { pages: pagesToRangeString(matches.map((item) => item.page)), confidence: "low", method: "page-label", notes: `Ambiguous page label occurs on ${matches.length} PDF pages.` };
+		if (/^\d+$/.test(labelReference)) {
+			const page = Number(labelReference);
+			if (page < 1 || page > info.pages) throw new Error(`Page ${page} is outside the valid PDF range 1-${info.pages}.`);
+			return { pages: labelReference, confidence: "low", method: "heuristic", notes: "Ambiguous unqualified page reference: no matching PDF page label. Use 'PDF page N' to address the physical PDF page explicitly." };
+		}
+	}
+	const bare = reference.match(/^\s*(\d+)\s*$/)?.[1];
+	if (bare) {
+		const page = Number(bare);
+		if (page < 1 || page > info.pages) throw new Error(`Page ${page} is outside the valid PDF range 1-${info.pages}.`);
+		return { pages: bare, confidence: "low", method: "heuristic", notes: "Ambiguous bare number; interpreted as a tentative PDF page. Use 'PDF page N' for certainty." };
 	}
 
 	const id = await documentId(path);
-	const outline = (await loadCachedOutline(id)) ?? (await getOutline(pi, path, 10, signal));
+	const fingerprint = await sourceFingerprint(path);
+	const outline = (await loadCachedOutline(id, fingerprint)) ?? (await getOutline(pi, path, 10, signal));
 	const flat = flattenOutline(outline).filter((entry) => entry.page);
 	const match = bestOutlineMatch(flat, reference);
 	if (match) {
@@ -887,12 +994,31 @@ export async function resolveReferenceInternal(
 		// Fall through to heuristic.
 	}
 
+	const fallbackEnd = Math.max(1, Math.min(5, info.pages));
 	return {
-		pages: "1-5",
+		pages: fallbackEnd === 1 ? "1" : `1-${fallbackEnd}`,
 		confidence: "low",
 		method: "heuristic",
-		notes: "Could not resolve reference from outline or search; returned the first five PDF pages as a safe starting point.",
+		notes: `Could not resolve reference from outline or search; returned the first ${fallbackEnd} PDF page${fallbackEnd === 1 ? "" : "s"} as a safe starting point.`,
 	};
+}
+
+const searchFingerprintMemo = new Map<string, { identity: string; fingerprint: string }>();
+
+export async function hasFreshSearchIndex(path: string, knownFingerprint?: string): Promise<boolean> {
+	try {
+		const fileStat = await stat(path);
+		const identity = `${fileStat.dev}:${fileStat.ino}:${fileStat.size}:${fileStat.mtimeMs}:${fileStat.ctimeMs}`;
+		const cached = searchFingerprintMemo.get(resolve(path));
+		const fingerprint = knownFingerprint ?? (cached?.identity === identity ? cached.fingerprint : await sourceFingerprint(path));
+		if (cached?.identity !== identity) {
+			searchFingerprintMemo.set(resolve(path), { identity, fingerprint });
+			if (searchFingerprintMemo.size > 5000) searchFingerprintMemo.delete(searchFingerprintMemo.keys().next().value!);
+		}
+		return hasFreshSqliteDocument(cacheRoot(), path, fileStat.size, fileStat.mtimeMs, fingerprint);
+	} catch {
+		return false;
+	}
 }
 
 export async function searchPdfDocuments(
@@ -904,7 +1030,7 @@ export async function searchPdfDocuments(
 	maxResults: number,
 	contextLines: number,
 	signal?: AbortSignal,
-): Promise<{ results: SearchResult[]; indexedDocuments: number; directDocuments: number }> {
+): Promise<{ results: SearchResult[]; indexedDocuments: number; directDocuments: number; staleDocuments: number; failures: Array<{ path: string; error: string }> }> {
 	if (!query.trim()) throw new Error("query must not be empty");
 	if (regex) {
 		try {
@@ -918,46 +1044,66 @@ export async function searchPdfDocuments(
 	const results: SearchResult[] = [];
 	let indexedDocuments = 0;
 	let directDocuments = 0;
+	let staleDocuments = 0;
+	const failures: Array<{ path: string; error: string }> = [];
 
-	const appendMatches = (pdfPath: string, doc: CatalogDocument | undefined, pages: CachedPage[], fromIndex: boolean) => {
+	const appendMatches = (pdfPath: string, doc: CatalogDocument | undefined, pages: CachedPage[]) => {
 		for (const page of pages) {
 			if (results.length >= maxResults) break;
 			const snippets = searchPage(page.text ?? page.layoutText ?? "", query, regex, caseSensitive, Math.max(0, contextLines));
 			for (const snippet of snippets) {
-				results.push({
-					path: pdfPath,
-					title: doc?.title,
-					page: page.page,
-					snippet,
-					score: fromIndex ? 1 : 0.8,
-				});
+				results.push({ path: pdfPath, title: doc?.title, page: page.page, snippet, score: 0.8 });
 				if (results.length >= maxResults) break;
 			}
 		}
 	};
 
-	for (const pdfPath of paths) {
+	// Literal, case-insensitive library search is served by FTS5. Verify each
+	// source generation before allowing its row into the ranked result set.
+	const ftsPaths: string[] = [];
+	const directPaths: string[] = [];
+	if (!regex && !caseSensitive) {
+		const states = sqliteDocumentStates(cacheRoot(), paths);
+		for (const path of paths) {
+			const state = states.get(resolve(path));
+			try {
+				const fileStat = await stat(path);
+				const identity = `${fileStat.dev}:${fileStat.ino}:${fileStat.size}:${fileStat.mtimeMs}:${fileStat.ctimeMs}`;
+				const memo = searchFingerprintMemo.get(resolve(path));
+				const fingerprint = memo?.identity === identity ? memo.fingerprint : await sourceFingerprint(path);
+				searchFingerprintMemo.set(resolve(path), { identity, fingerprint });
+				if (state?.status === "indexed" && state.sizeBytes === fileStat.size && state.mtimeMs === fileStat.mtimeMs && state.fingerprint === fingerprint) ftsPaths.push(path);
+				else { if (state?.status === "indexed") staleDocuments++; if (state?.status === "failed") failures.push({ path, error: state.error ?? "indexing failed" }); directPaths.push(path); }
+			} catch (error: any) { failures.push({ path, error: error?.message ?? String(error) }); }
+		}
+		if (ftsPaths.length) {
+			const searched = searchSqliteIndex(cacheRoot(), query, ftsPaths, maxResults, contextLines);
+			results.push(...searched.results);
+			indexedDocuments = searched.indexedPaths.size;
+			failures.push(...searched.failed);
+			if (!searched.representable) directPaths.unshift(...ftsPaths);
+		}
+	} else {
+		// Regex and case-sensitive semantics are not provided by FTS5. Extract
+		// directly rather than reverting to whole-corpus JSONL parsing.
+		directPaths.push(...paths);
+	}
+
+	for (const pdfPath of directPaths) {
 		if (results.length >= maxResults) break;
 		const doc = byPath.get(resolve(pdfPath));
 		try {
-			const cached = await readFreshCachedPagesForSearch(pdfPath, doc);
-			if (cached) {
-				indexedDocuments++;
-				appendMatches(pdfPath, doc, cached, true);
-				continue;
-			}
-
 			directDocuments++;
 			const info = await getPdfInfo(pi, pdfPath, signal);
 			for await (const chunk of extractPageChunks(pi, pdfPath, Math.max(1, info.pages), "layout", PDF_TEXT_CHUNK_SIZE, signal)) {
-				appendMatches(pdfPath, doc, chunk, false);
+				appendMatches(pdfPath, doc, chunk);
 				if (results.length >= maxResults) break;
 			}
-		} catch {
-			continue;
+		} catch (error: any) {
+			failures.push({ path: pdfPath, error: error?.message ?? String(error) });
 		}
 	}
-	return { results, indexedDocuments, directDocuments };
+	return { results: results.slice(0, maxResults), indexedDocuments, directDocuments, staleDocuments, failures };
 }
 
 export async function renderOnePage(
@@ -967,18 +1113,35 @@ export async function renderOnePage(
 	page: number,
 	dpi: number,
 	signal?: AbortSignal,
+	expectedFingerprint?: string,
 ): Promise<string> {
-	const dir = renderDir(docId);
-	await mkdir(dir, { recursive: true });
-	const prefix = join(dir, `page-${page}-dpi-${dpi}`);
-	const before = new Set(await readdir(dir).catch(() => []));
-	await runCommand(pi, "pdftoppm", ["-png", "-r", String(dpi), "-f", String(page), "-l", String(page), path, prefix], signal, 180_000);
-	const after = await readdir(dir);
-	const created = after.find((name) => !before.has(name) && name.startsWith(basename(prefix)) && name.endsWith(".png"));
-	if (created) return join(dir, created);
-	const existing = after.find((name) => name.startsWith(basename(prefix)) && name.endsWith(".png"));
-	if (existing) return join(dir, existing);
-	throw new Error("pdftoppm finished, but no rendered PNG was found");
+	const fingerprint = expectedFingerprint ?? await sourceFingerprint(path);
+	const dir = join(renderDir(docId), fingerprint);
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	const finalPath = join(dir, `page-${page}-dpi-${dpi}.png`);
+	if (await exists(finalPath)) {
+		if (await sourceFingerprint(path) !== fingerprint) throw new Error(`PDF changed before cached render could be used: ${path}`);
+		return finalPath;
+	}
+	const tempDir = await mkdtemp(join(dir, ".render-"));
+	try {
+		const prefix = join(tempDir, "page");
+		await runCommand(pi, "pdftoppm", ["-singlefile", "-png", "-r", String(dpi), "-f", String(page), "-l", String(page), path, prefix], signal, 180_000);
+		if (await sourceFingerprint(path) !== fingerprint) throw new Error(`PDF changed while rendering; artifact was not published: ${path}`);
+		const generated = (await readdir(tempDir)).find((name) => name.endsWith(".png"));
+		if (!generated) throw new Error("pdftoppm finished, but no rendered PNG was found");
+		await rename(join(tempDir, generated), finalPath).catch(async (error: any) => { if (!(error?.code === "EEXIST" && await exists(finalPath))) throw error; });
+		return finalPath;
+	} finally {
+		await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+	}
+}
+
+export async function assertTesseractLanguage(pi: ExtensionAPI, language: string, signal?: AbortSignal): Promise<void> {
+	const { stdout } = await runCommand(pi, "tesseract", ["--list-langs"], signal, 30_000);
+	const installed = new Set(stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !/list of available/i.test(line)));
+	const missing = language.split("+").filter((lang) => !installed.has(lang));
+	if (missing.length) throw new Error(`Tesseract language data unavailable: ${missing.join(", ")}. Installed: ${[...installed].join(", ") || "none"}. Install the requested tessdata language pack or choose an installed language.`);
 }
 
 export async function ocrOnePage(
@@ -989,17 +1152,23 @@ export async function ocrOnePage(
 	dpi: number,
 	language: string,
 	signal?: AbortSignal,
+	expectedFingerprint?: string,
+	languagePreflighted = false,
 ): Promise<string> {
-	const dir = ocrDir(docId);
-	await mkdir(dir, { recursive: true });
+	if (!languagePreflighted) await assertTesseractLanguage(pi, language, signal);
+	const fingerprint = expectedFingerprint ?? await sourceFingerprint(path);
+	const dir = join(ocrDir(docId), fingerprint);
+	await mkdir(dir, { recursive: true, mode: 0o700 });
 	const safeLanguage = language.replace(/[^a-zA-Z0-9_+-]/g, "_");
 	const textPath = join(dir, `page-${page}-dpi-${dpi}-lang-${safeLanguage}.txt`);
-	if (await exists(textPath)) return readFile(textPath, "utf8");
-	const imagePath = await renderOnePage(pi, path, docId, page, dpi, signal);
+	if (await exists(textPath)) {
+		if (await sourceFingerprint(path) !== fingerprint) throw new Error(`PDF changed before cached OCR could be used: ${path}`);
+		return readFile(textPath, "utf8");
+	}
+	const imagePath = await renderOnePage(pi, path, docId, page, dpi, signal, fingerprint);
 	const { stdout } = await runCommand(pi, "tesseract", [imagePath, "stdout", "-l", language, "--dpi", String(dpi)], signal, 240_000);
-	await withFileMutationQueue(textPath, async () => {
-		await writeFile(textPath, stdout, "utf8");
-	});
+	if (await sourceFingerprint(path) !== fingerprint) throw new Error(`PDF changed during OCR; artifact was not published: ${path}`);
+	await withFileMutationQueue(textPath, async () => atomicWrite(textPath, stdout));
 	return stdout;
 }
 

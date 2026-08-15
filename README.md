@@ -1,53 +1,76 @@
 # pi-pdf-reader
 
-Pi extension for reading technical PDFs with Poppler/qpdf/Tesseract tools.
+Local Pi extension for reading technical PDFs with Poppler, qpdf, Tesseract, and SQLite FTS5.
 
-## Tools
+## Core model-facing tools
 
-- `pdf_library_scan` — scan `~/vault/sources` or another root and refresh a compact catalog.
-- `pdf_info` — detailed metadata for one PDF.
-- `pdf_outline` — extract bookmarks/table of contents.
-- `pdf_resolve_reference` — resolve `chapter 5`, `section 7.3`, `page 214`, or topic text to PDF pages.
-- `pdf_extract` — page-bounded text extraction with `plain`, `layout`, `blocks`, or `markdown` modes.
-- `pdf_search` — page-cited search in one PDF or the library, using cache when available.
-- `pdf_index_build` / `pdf_index_update` — build/update the page-text cache under `~/.cache/pi-pdf`.
-- `pdf_render_page` — render a page to PNG for visual inspection via Pi's `read` tool.
-- `pdf_ocr` — OCR selected pages with Tesseract; cached per page/dpi/language.
-- `pdf_extract_images` — extract embedded PDF images/figures.
+Exactly four PDF tools are active by default:
+
+- `pdf_inspect` — metadata, extraction quality, compact page-label samples, index freshness, and opt-in bounded outline.
+- `pdf_search` — BM25-ranked, page-cited indexed search; direct/regex/case-sensitive fallback is traversal ordered.
+- `pdf_read` — bounded explicit pages or one resolved section in plain/layout/blocks/markdown modes; `pages` and `section` are mutually exclusive.
+- `pdf_render` — render one page to PNG for visual inspection with Pi's `read` tool.
+
+Legacy tool names remain registered for resumed-session compatibility but are inactive. Optional OCR and embedded-image tools can be enabled explicitly without disabling tools from other extensions.
+
+## Commands
+
+Index maintenance stays outside ordinary model context:
+
+```text
+/pdf-index status
+/pdf-index update [library-root]
+/pdf-index build [library-root]
+```
+
+Optional tools are lazy and disabled at session start:
+
+```text
+/pdf-tools list
+/pdf-tools enable ocr
+/pdf-tools enable images
+/pdf-tools enable all
+/pdf-tools disable ocr
+/pdf-tools disable all
+```
+
+Enabling OCR exposes `pdf_ocr`; enabling images exposes `pdf_extract_images`. A new/reloaded session returns to the four core PDF tools.
 
 ## Structure
 
 - `index.ts` — Pi extension entry point.
-- `src/tools.ts` — `pi.registerTool(...)` definitions and tool orchestration.
+- `src/tools.ts` — core/compatibility tools and maintenance commands.
 - `src/core.ts` — PDF/cache/search/render/OCR backend helpers.
-- `src/constants.ts` — defaults and limits.
-- `src/types.ts` — shared TypeScript types.
-- `skills/pdf-reading/SKILL.md` — workflow skill for PDF reading/searching/summarization.
+- `src/index-db.ts` — transactional SQLite FTS5 index.
+- `src/constants.ts` / `src/types.ts` — limits and shared types.
+- `skills/pdf-reading/SKILL.md` — progressively disclosed reading workflow.
 
 ## Requirements
 
-The extension uses existing system tools:
+Use Node.js 22.5 or newer with built-in `node:sqlite` and SQLite FTS5 (Node 24+ recommended). System tools:
 
 ```bash
 pdftotext pdfinfo qpdf pdftoppm pdfimages tesseract
 ```
 
-## Use
+Install the Tesseract language packs you use (for example `tesseract-ocr-eng`). OCR checks requested language data before running.
 
-From this directory:
+## Use
 
 ```bash
 pi -e .
 ```
 
-Install globally:
+Or install locally:
 
 ```bash
 pi install /home/red/dotfiles/pi/picosystem/pdf-reader
 ```
 
-Or add it to project settings as a local package.
+## Storage and correctness
 
-## Notes
+The search index is `~/.cache/pi-pdf/search-index.sqlite3`. It stores original page text for quotations/citations plus normalized FTS text that repairs line-wrap hyphenation. Artifact identities include source fingerprints and relevant options, so replacing a PDF does not reuse old text, outlines, OCR, renders, or images.
 
-The first version intentionally avoids runtime npm dependencies. The index is a JSONL page cache plus `catalog.json` in `~/.cache/pi-pdf`; this keeps search fast after indexing without native SQLite dependencies. A future version can add SQLite FTS or a PyMuPDF backend for better structured layout extraction.
+Cache files can contain sensitive extracted text and images; private permissions are requested where supported. Remove `~/.cache/pi-pdf` to clear retained content. Per-document writer serialization is process-local, so avoid concurrent index writers from multiple Pi processes.
+
+Model-requested page operations are bounded to 100 pages. Every tool response is capped at Pi's 50 KB / 2,000-line limits. Search reports stale/failed documents and uses direct extraction when appropriate.

@@ -4,6 +4,9 @@
   "description": "Pi extension for reading, searching, rendering, and OCRing technical PDFs.",
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -30,5 +33,14 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "test": "tsx --test test/**/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
   }
 }
